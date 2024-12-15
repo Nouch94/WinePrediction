@@ -1,0 +1,356 @@
+---
+title: "Wine Quality Analysis and Prediction"
+author: "Gerden Clark, Solomon Matthew, Vanessa Nkongolo"
+date: "2024-12-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# DDS 6306 Wine Quality Project  
+
+### Team: Gerden Clark, Solomon Matthew, Vanessa Nkongolo  
+#### Date: December 14, 2024  
+
+
+##### Scope: To develop an effective model for predicting wine quality based on collected data of wine chemistry, contracted by Robert Renzoni Vineyards in Riverside California. The performance of the model is based upon mean absolute error (MAE), the lower this value the better performing the model is. The contractor has also requested an output of feature importance to the prediction model. Additionally, a challenge has been set forth to submit a linear regression model with the lowest possible MAE for competitive purposes, this model does not need to be the chosen model for the client.  
+
+## Libraries  
+
+```{r, echo=TRUE, message=FALSE,warning=FALSE}
+
+# Load necessary libraries
+library(caret)
+library(corrplot)
+library(dplyr)
+library(ggcorrplot)
+library(GGally)
+library(ggplot2)
+library(glmnet)
+library(Metrics)
+library(modeldata)
+library(plotly)
+library(randomForest)
+library(readxl)
+library(reshape2)
+library(tidyverse)
+
+```
+## Data Engineering
+
+```{r}
+# Data is contained in CSV files called "Wine Train", "Wine Test", and "Wine Types And Locations" which are locally stored
+
+train = read.csv("C:/Users/gerde/OneDrive/Documents/DS_6306_Materials/Final Project/Wine Train.csv")
+test = read.csv("C:/Users/gerde/OneDrive/Documents/DS_6306_Materials/Final Project/Wine Test Set.csv")
+wine_types_locations <- readxl::read_excel("C:/Users/gerde/OneDrive/Documents/DS_6306_Materials/Final Project/Wine Types And Locations.xlsx")
+
+winetrain = merge(train, wine_types_locations, by = "ID")
+winetest = merge(test, wine_types_locations, by = "ID")
+
+# Change the incorrect spelling of Califormia to California for uniformity
+winetrain$location <- gsub("Califormia", "California", winetrain$location)
+winetest$location <- gsub("Califormia", "California", winetest$location)
+
+# Inspect data structure
+str(winetrain)
+str(winetest)
+
+# Preview top 5 rows from each to verify data
+head(winetrain,5)
+head(winetest,5)
+
+# Impute missing values for numeric columns with mean
+winetrain = winetrain %>% mutate(across(where(is.numeric), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+winetest = winetest %>% mutate(across(where(is.numeric), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+# Handle missing 'type' with most frequent value
+frequentMostTrain = names(sort(table(winetrain$type), decreasing = TRUE))[1]
+frequentMostTest = names(sort(table(winetest$type), decreasing = TRUE))[1]
+winetrain$type[is.na(winetrain$type)] = frequentMostTrain
+winetest$type[is.na(winetest$type)] = frequentMostTest
+
+# Remove difference in case for the "type" column
+winetrain$type = tolower(winetrain$type)
+winetest$type = tolower(winetest$type)
+
+# Convert 'type' and 'location' to factors
+winetrain$type = as.factor(winetrain$type)
+winetrain$location = as.factor(winetrain$location)
+winetest$type = as.factor(winetest$type)
+winetest$location = as.factor(winetest$location)
+
+```
+
+## Correlation Matrix  
+
+```{r}
+
+# Compute correlation matrix
+correlation_matrix = cor(winetrain %>% select_if(is.numeric))
+
+# Create a correlation plot using ggcorrplot
+p = ggcorrplot(correlation_matrix, 
+                hc.order = TRUE, 
+                type = "lower", 
+                lab = TRUE, 
+                lab_size = 3, 
+                method = "circle", 
+                colors = c("tomato2", "white", "springgreen3"),
+                title = "Correlation Heatmap",
+                ggtheme = ggplot2::theme_minimal()) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Convert the ggplot object to an interactive plotly object
+
+# First, melt the correlation matrix for easier data manipulation
+melted_cormat = melt(correlation_matrix, na.rm = TRUE)
+
+# Plot with plotly for interactivity
+plotly_corr = plot_ly(
+  x = melted_cormat$Var1,
+  y = melted_cormat$Var2,
+  z = melted_cormat$value,
+  type = "heatmap",
+  colorscale = "RdBu",
+  showscale = TRUE,
+  hoverinfo = "text"
+) %>%
+  layout(
+    xaxis = list(title = ""),
+    yaxis = list(title = ""),
+    title = "Feature Correlation Matrix",
+    font = list(size = 12)
+  ) %>%
+  colorbar(title = "Correlation", len = 0.5)
+
+# Display the interactive plot
+plotly_corr
+
+```
+
+## Model Selection  
+
+#### The models we chose to try out are a polynomial regression model and a random forest model. Both models are commonly used for numerical data due to their ability to determine linear relationships of data.  
+
+### Regression Model  
+
+```{r}
+
+# Feature Engineering for regression model
+winetrainE = winetrain %>%
+  mutate(
+    type_white = ifelse(type == "white", 1, 0),
+    type_unknown = ifelse(type == "unknown", 1, 0),
+    location_Texas = ifelse(location == "Texas", 1, 0),
+    alcohol_density = alcohol * density,
+    alcohol_sulphates = alcohol * sulphates,
+    alcohol_squared = alcohol^2,
+    density_squared = density^2,
+    log_residual_sugar = log(residual.sugar + 1),
+    log_chlorides = log(chlorides + 1)
+  )
+
+# Apply same transformations to test set
+winetestE = winetest %>%
+  mutate(
+    type_white = ifelse(type == "white", 1, 0),
+    type_unknown = ifelse(type == "unknown", 1, 0),
+    location_Texas = ifelse(location == "Texas", 1, 0),
+    alcohol_density = alcohol * density,
+    alcohol_sulphates = alcohol * sulphates,
+    alcohol_squared = alcohol^2,
+    density_squared = density^2,
+    log_residual_sugar = log(residual.sugar + 1),
+    log_chlorides = log(chlorides + 1)
+  )
+
+# Split data into train/test sets
+set.seed(44)
+splitPerc = 0.75
+trainIndices = sample(1:dim(winetrainE)[1], round(splitPerc * dim(winetrainE)[1]))
+train_data = winetrainE[trainIndices, ]
+test_data = winetrainE[-trainIndices, ]
+
+# Fit linear model
+fit = lm(quality ~ ., data = train_data)
+summary(fit)
+
+# Predictions and MAE
+predictions = predict(fit, newdata = test_data)
+actual = test_data$quality
+mae = mean(abs(actual - predictions))
+cat("Polynomial Regression Mean Absolute Error on Training Data:", mae, "\n")
+
+# Predict on test data using Polynomial Regression
+test_preds_poly = predict(fit, winetestE)
+
+
+```
+
+### Random Forest Model  
+
+```{r}
+
+# Split features and target variable for training
+x_train = winetrain %>% select(-quality)
+y_train = winetrain$quality
+
+# Train a Random Forest model
+set.seed(44)
+rf_model = randomForest(x = x_train, y = y_train, 
+                        ntree = 500, mtry = 4, importance = TRUE)
+
+# Evaluate model on training data
+train_preds = predict(rf_model, x_train)
+mae_train = mae(as.numeric(y_train), as.numeric(train_preds)) 
+cat("Random Forest Mean Absolute Error on Training Data:", mae_train, "\n")
+
+# Predict on test data
+test_preds = predict(rf_model, winetest)
+
+```
+## Output Predictions
+
+```{r}
+
+# Display mean of the predicted wine qualities for each model
+mean(test_preds)
+mean(test_preds_poly)
+
+# Save predictions
+test_results = test
+test_results$Random_Forest_Predictions = test_preds
+test_results$Polynomial_Linear_Regression_Predictions = test_preds_poly
+tr_trimmed = test_results %>% select(ID,Random_Forest_Predictions,Polynomial_Linear_Regression_Predictions)
+
+# Verify data is properly structured
+str(tr_trimmed)
+
+# Write data to CSV file
+write.csv(tr_trimmed, "C:/Users/gerde/OneDrive/Documents/DS_6306_Materials/Final Project/New_Wine_Test_Predictions.csv", row.names = FALSE)
+
+
+```
+
+## Visualizations
+
+```{r}
+
+# Enhanced relationship between alcohol and quality scatter plot
+ggplot(train_data, aes(x = alcohol, y = quality)) +
+  geom_jitter(width = 1, height = 1, alpha = 0.6, size = 1, color = "maroon") +  
+  geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed", linewidth = 1.5) +  
+  scale_x_continuous(breaks = seq(8, 15, by = 1)) +  
+  scale_y_continuous(breaks = seq(3, 9, by = 1)) +  
+  labs(title = "Alcohol Content vs Wine Quality",
+       subtitle = "Each point represents a wine sample",
+       x = "Alcohol Content (%)", 
+       y = "Quality Rating (1-10)",
+       caption = "Source: Wine Dataset") +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    plot.caption = element_text(size = 8, color = "gray50"),
+    panel.grid.minor = element_blank()  
+  )
+
+
+# Stacked bar plot of wine type by location with custom colors
+wine_counts <- winetrain %>%
+  group_by(location, type) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = count / sum(count)) %>%
+  ungroup()
+
+ggplot(wine_counts, aes(x = location, y = percentage, fill = type)) +
+  geom_bar(stat = "identity", position = "fill") +
+  geom_text(aes(label = scales::percent(percentage, accuracy = 1)),
+            position = position_stack(vjust = 0.5),
+            size = 3) +
+  scale_fill_manual(values = c("red" = "maroon", "white" = "white")) +
+  labs(title = "Distribution of Wine Type by Location",
+       x = "Location",
+       y = "Proportion",
+       fill = "Wine Type") +
+  theme_minimal() +
+  theme(panel.background = element_rect(fill = "gray"))
+
+# Density plot of wine quality split by location
+ggplot(winetrain, aes(x = quality, fill = location)) +
+  geom_density(alpha = 0.5) +  # Semi-transparent fill for visibility
+  facet_wrap(~location, scales = "free_y") +  # Create panels for each location
+  scale_fill_brewer(palette = "Set1") +  # Use a color palette for distinction
+  labs(title = "Distribution of Wine Quality by Location",
+       subtitle = "Density of quality ratings among wines",
+       x = "Wine Quality Rating (1-10)",
+       y = "Density") +
+  
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 10),
+    strip.text = element_text(size = 12),  # Size for facet labels
+    legend.position = "none",  # Remove legend if redundant with facets
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.background = element_rect(fill = "#F0F0F0", color = NA),
+    axis.line = element_line(colour = "black")
+  )
+
+
+# Enhanced bar plot of correlations including negative values
+
+# Compute correlations with quality
+correlations <- winetrain %>%
+  select(-type, -location) %>%
+  summarise(across(where(is.numeric), ~ cor(., winetrain$quality))) %>%
+  pivot_longer(cols = everything(), names_to = "Predictor", values_to = "Correlation")
+
+# Sort by correlation
+correlations <- correlations %>% arrange(Correlation)
+
+
+ggplot(correlations, aes(x = reorder(Predictor, Correlation), y = Correlation)) +
+  geom_bar(stat = "identity", 
+           aes(fill = ifelse(Correlation > 0, "#8B0000", "pink")), 
+           color = "black", width = 0.7) +  
+  geom_text(aes(label = round(Correlation, 2)), 
+            vjust = ifelse(correlations$Correlation > 0, -0.5, 1.5), 
+            hjust = ifelse(correlations$Correlation > 0, -0.2, 1.2), 
+            size = 3, color = "black") +  
+  coord_flip() +
+  scale_y_continuous(limits = c(min(correlations$Correlation) * 1.1, max(correlations$Correlation) * 1.1), 
+                     expand = c(0, 0)) +  
+  labs(title = "Correlation of Predictors with Wine Quality",
+       subtitle = "Sorted by absolute strength of correlation",
+       x = "Predictors",
+       y = "Correlation Coefficient") +
+  scale_fill_identity(guide = "legend", labels = c("Positive","Negative")) +  
+  
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.background = element_rect(fill = "#F0F0F0", color = NA),
+    axis.line = element_line(colour = "black"),
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    plot.margin = unit(c(1, 1, 1, 1), "cm")
+  )
+
+```
+
+## Conclusions  
+
+#### Based on the MAE values obtained from the random forest model and polynomial regression model, the best overall model based upon MAE is the random forest model.   
+#### Alcohol is the most significant contributing feature used for predicting quality of wine, higher alcohol content equates to higher quality.  
+#### Despite the difference in the Texas vs. California wine quality density plots, this feature had no significance in the models. 
